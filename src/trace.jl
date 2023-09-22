@@ -280,7 +280,8 @@ rewrite_special_cases(st) = st
 function get_static_params(t::Tracer, v_fargs::VecOrTuple)
     fvals = [v isa V ? t.tape[v].val : v for v in v_fargs]
     fn, vals... = fvals
-    mi = Base.method_instances(fn, map(Core.Typeof, vals))[1]
+    mi = Base.method_instances(fn, map(Core.Typeof, vals),
+        ccall(:jl_get_world_counter, UInt, ()))[1]
     mi_dict = Dict(zip(sparam_names(mi), mi.sparam_vals))
     return mi.sparam_vals, mi_dict
 end
