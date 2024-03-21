@@ -275,12 +275,25 @@ function vararg_fn(x, xs...)
     return x + sum(xs)
 end
 
-multiarg_fn(x) = x
-multiarg_fn(x, y) = x + y
-multiarg_fn(x, y, z) = x + y + z
+multiarg_fn(x) = only(x)
+multiarg_fn(x, y) = only(x) + only(y)
+multiarg_fn(x, y, z) = only(x) + only(y) + only(z)
 
+function vararg_fn_sparam(x, xs::Vararg{T,N}) where {T,N}
+    T(N)
+end
 
 @testset "trace: varargs, splatting" begin
+
+    @testset "__to_tuple__" begin
+        @test Umlaut.__to_tuple__(5.0) == (5.0, )
+        @test Umlaut.__to_tuple__((5.0, 4.0)) == (5.0, 4.0)
+        @test Umlaut.__to_tuple__((a=5.0, b="hi")) == (5.0, "hi")
+        @test Umlaut.__to_tuple__([5.0, 4.0, 3.0]) == (5.0, 4.0, 3.0)
+        @test Umlaut.__to_tuple__(zip([1.0, 2.0, 3.0])) == ((1.0, ), (2.0, ), (3.0, ))
+        @test Umlaut.__to_tuple__(Core.svec(1.0, 2.0)) == (1.0, 2.0)
+    end
+
     # varargs
     _, tape = trace(vararg_fn, 1, 2, 3)
     @test play!(tape, vararg_fn, 4, 5, 6) == vararg_fn(4, 5, 6)
@@ -297,12 +310,17 @@ multiarg_fn(x, y, z) = x + y + z
     _, tape = trace(vararg_wrapper, (1, 2, 3))
     @test play!(tape, vararg_wrapper, (4, 5, 6)) == vararg_wrapper((4, 5, 6))
 
+    res, tape = trace(vararg_fn_sparam, 1, 1.0, 1.0)
+    @test res === 2.0
+    @test play!(tape, vararg_fn_sparam, 1, 1.0, 1.0) == vararg_fn_sparam(1, 1.0, 1.0)
+    @test compile(tape)(vararg_fn_sparam, 1, 1.0, 1.0) == vararg_fn_sparam(1, 1.0, 1.0)
+
     # tuple/vararg unpacking
     f = t -> multiarg_fn(t...)
     _, tape = trace(f, (1, 2))
     @test play!(tape, f, (3, 4)) == f((3, 4))
-    @test tape[V(4)].fn == Base.getindex
-    @test tape[V(5)].fn == Base.getindex
+    @test tape[V(5)].fn == Base.getfield
+    @test tape[V(6)].fn == Base.getfield
 
     @test_logs (:warn, "Variable %2 had length 2 during tracing, but now has length 3") play!(tape, f, (5, 6, 7))
 
@@ -311,8 +329,25 @@ multiarg_fn(x, y, z) = x + y + z
     _, tape = trace(f, 1)
     @test play!(tape, f, 2) == f(2)
     v2 = V(tape, 2)
-    @test (tape[V(end)].fn == +) && (tape[V(end)].args == [v2, v2, 1])
+    v6 = V(tape, 6)
+    if VERSION >= v"1.9"
+        @test (tape[V(end)].fn == +) && (tape[V(end)].args == [v2, v2, v6])
+    end
 
+    test_f = x -> multiarg_fn(x...)
+    @testset "$name" for (name, x) in [
+        ("splat single Int", 1),
+        ("splat single Float64", 1.0),
+        ("splat Vector{Float64}", [1.0, 2.0]),
+        ("splat Tuple{Float64, Int}", (5.0, 4)),
+        ("splat NamedTuple(Float64, Int)", (a=5.0, b=2)),
+        ("splat zip", zip([1.0, 2.0, 3.0])),
+        ("splat Core.SimpleVector", Core.svec(1.0, 2.)),
+    ]
+        @test test_f(x) === test_f(x)
+        v, tape = trace(test_f, x)
+        @test v == test_f(x)
+    end
 end
 
 
@@ -336,8 +371,14 @@ end
 
     # constructors
     _, tape = trace(constructor_loss, 4.0)
-    @test tape[V(3)].val == Point
-    @test tape[V(4)].fn == __new__
+    @test tape[V(3)].val isa Point
+    @test_broken tape[V(4)].fn == __new__  # test broken in v1.10
+
+    # Exact code generated is version dependent -- either is fine.
+    @test(
+        (tape[V(3)].val == Point && tape[V(4)].fn == __new__) ||
+        (tape[V(3)].fn == __new__ && tape[V(3)].args[1] == Point)
+    )
 
     # constructor with splatnew
     # This test seems to be quite brittle, and to depend on the precise version of Julia
@@ -655,4 +696,58 @@ end
     res, _ = trace(ismissing, missing)
     @test !ismissing(res)
     @test res === true
+end
+
+###############################################################################
+
+function enter_leave_tester(x)
+    try
+        x > 0 && throw(error("an error"))
+    catch
+        x += 1
+    end
+    return x
+end
+
+@testset "enter" begin
+    y, tape = trace(enter_leave_tester, -0.5)
+    @test y == enter_leave_tester(-0.5)
+    @test enter_leave_tester(0.5) == 1.5
+    @test_throws ErrorException trace(enter_leave_tester, 0.5)
+end
+
+###############################################################################
+
+# Cannot be traced if you don't check if the `values` field of a `PhiNode` is
+# defined or not before accessing.
+function conditionally_defined_tester(x)
+    isneg = x < 0
+    if isneg
+        y = 1.0
+    end
+    if isneg
+        x += y
+    end
+    return x
+end
+
+@testset "undef in PhiNode" begin
+    res, tape = trace(conditionally_defined_tester, 5.0)
+    @test res == conditionally_defined_tester(5.0)
+    @test play!(tape, conditionally_defined_tester, 5.0) == res
+end
+
+###############################################################################
+
+function undefcheck_tester(x)
+    if x > 0
+        y = 5.0
+    end
+    return y # the compiler inserts an :undefcheck expression near here.
+end
+
+@testset "undefcheck" begin
+    res, tape = trace(undefcheck_tester, 5.0)
+    @test res == undefcheck_tester(5.0)
+    @test play!(tape, undefcheck_tester, 5.0) == res
 end

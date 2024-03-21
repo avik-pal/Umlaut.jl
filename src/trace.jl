@@ -17,6 +17,17 @@ const VecOrTuple = Union{Tuple, Vector}
 #                                  Frame                                      #
 ###############################################################################
 
+# see https://github.com/dfdx/Umlaut.jl/issues/58
+function new_exprs(ir::IRCode)
+    stmts = ir.new_nodes.stmts
+    if hasfield(typeof(stmts), :inst)
+        return stmts.inst
+    else
+        return stmts.stmt
+    end
+end
+
+
 """
     block_expressions(ir::IRCode)
 
@@ -25,7 +36,7 @@ Returns Vector{block_info}, where block_info is Vector{ssa_id => expr}
 """
 function block_expressions(ir::IRCode)
     # new statements
-    new_exs = ir.new_nodes.stmts.inst
+    new_exs = new_exprs(ir)
     # where to insert them
     new_positions = [(info.attach_after ? info.pos + 1 : info.pos)
                     for info in ir.new_nodes.info]
@@ -237,11 +248,7 @@ Tracer(tape::Tape{C}) where C = Tracer{C}(tape, [])
 
 
 function getcode(f, argtypes)
-    irs = @static if VERSION < v"1.9"
-        code_ircode_by_signature(no_pass, Tuple{Core.Typeof(f), argtypes...})
-    else
-        Base.code_ircode(f, argtypes; optimize_until="slot2reg")
-    end
+    irs = Base.code_ircode(f, argtypes; optimize_until="slot2reg")
     @assert !isempty(irs) "No IR found for $f($argtypes...)"
     @assert length(irs) == 1 "More than one IR found for $f($argtypes...)"
     @assert irs[1] isa Pair{IRCode, <:Any} "Expected Pair{IRCode,...}, " *
@@ -282,9 +289,7 @@ end
 rewrite_special_cases(st) = st
 
 function get_static_params(t::Tracer, v_fargs::VecOrTuple)
-    fvals = [v isa V ? t.tape[v].val : v for v in v_fargs]
-    fn, vals... = fvals
-    mi = Base.method_instances(fn, map(Core.Typeof, vals))[1]
+    mi = Base.method_instances(code_signature(t.tape.c, v_fargs)..., Base.get_world_counter())[1]
     mi_dict = Dict(zip(sparam_names(mi), mi.sparam_vals))
     return mi.sparam_vals, mi_dict
 end
@@ -325,7 +330,11 @@ function record_or_recurse!(t, vs...)
 end
 
 
-is_control_flow(ex) = ex isa GotoNode || ex isa GotoIfNot || ex isa ReturnNode
+function is_control_flow(ex)
+    return ex isa GotoNode || ex isa GotoIfNot || ex isa ReturnNode ||
+        Meta.isexpr(ex, :enter)
+end
+
 
 
 function getlineinfo(ir::IRCode, pc::Integer)
@@ -337,7 +346,6 @@ function getlineinfo(ir::IRCode, pc::Integer)
         return "near $(approx_loc.file):$(approx_loc.line)"
     end
 end
-
 
 function trace_block!(t::Tracer, ir::IRCode, bi::Integer, prev_bi::Integer, sparams, sparams_dict)
     frame = t.stack[end]
@@ -358,7 +366,16 @@ function trace_block!(t::Tracer, ir::IRCode, bi::Integer, prev_bi::Integer, spar
             # map current pc to the currently active value of Phi node
             ir2tape = t.stack[end].ir2tape
             k = indexin(prev_bi, ex.edges)[]
-            ir2tape[SSAValue(pc)] = ir2tape[ex.values[k]]
+            if isassigned(ex.values, k)
+                v = ex.values[k]
+                # It is possible that the value associated to a PhiNode is a constant,
+                # raather than a Variable.
+                if v isa Union{Core.SSAValue, Core.Argument}
+                    ir2tape[SSAValue(pc)] = ir2tape[v]
+                else
+                    ir2tape[SSAValue(pc)] = v
+                end
+            end
         elseif ex isa Core.PiNode
             # val = t.tape[frame.ir2tape[ex.val]].val
             # frame.ir2tape[SSAValue(pc)] = push!(t.tape, Constant(val; line))
@@ -388,8 +405,13 @@ function trace_block!(t::Tracer, ir::IRCode, bi::Integer, prev_bi::Integer, spar
                 t.tape,
                 mkcall(__foreigncall__, name, RT, AT, nreq, calling_convention, x...),
             )
+        elseif Meta.isexpr(ex, :undefcheck)
+            @assert haskey(frame.ir2tape, ex.args[2])
+        elseif Meta.isexpr(ex, :throw_undef_if_not)
+            @assert haskey(frame.ir2tape, ex.args[2])
         elseif ex isa Expr && ex.head in [
             :code_coverage_effect, :gc_preserve_begin, :gc_preserve_end, :loopinfo,
+            :leave, :pop_exception,
         ]
             # ignored expressions, just skip it
         elseif ex isa Expr
@@ -465,6 +487,10 @@ function code_signature(ctx, v_fargs)
     return fargtypes
 end
 
+__to_tuple__(x::Tuple) = x
+__to_tuple__(x::NamedTuple) = Tuple(x)
+__to_tuple__(x::Array) = Tuple(x)
+__to_tuple__(x) = __to_tuple__(collect(x))
 
 """
     unsplat!(t::Tracer, v_fargs)
@@ -473,8 +499,6 @@ In the lowered form, splatting syntax f(xs...) is represented as
 Core._apply_iterate(f, xs). unsplat!() reverses this change and transformes
 v_fargs to a normal form, possibly destructuring xs into separate variables
 on the tape.
-
-See also: [`group_varargs!()`](@ref)
 """
 function unsplat!(t::Tracer, v_fargs)
     f = v_fargs[1] isa V ? t.tape[v_fargs[1]] : v_fargs[1]
@@ -491,8 +515,10 @@ function unsplat!(t::Tracer, v_fargs)
             if is_tuple
                 push!(actual_v_args, iter.args...)
             else
-                for i in eachindex(iter.val)
-                    x = push!(t.tape, mkcall(getindex, v, i; line="Umlaut.unsplat!"))
+                tuple_v = push!(t.tape, mkcall(__to_tuple__, v; line="Umlaut.unsplat!"))
+                iter = t.tape[tuple_v].val
+                for i in eachindex(iter)
+                    x = push!(t.tape, mkcall(getfield, tuple_v, i; line="Umlaut.unsplat!"))
                     push!(actual_v_args, x)
                 end
             end
@@ -557,10 +583,10 @@ function trace!(t::Tracer, v_fargs)
     # note: we need to extract IR before vararg grouping, which may change
     # v_fargs, thus invalidating method search
     ir = getcode(code_signature(t.tape.c, v_fargs)...)
+    sparams, sparams_dict = get_static_params(t, v_fargs)
     v_fargs = group_varargs!(t, v_fargs)
     frame = Frame(t.tape, ir, v_fargs...)
     push!(t.stack, frame)
-    sparams, sparams_dict = get_static_params(t, v_fargs)
     bi = 1
     prev_bi = 0
     cf = nothing
@@ -599,6 +625,9 @@ function trace!(t::Tracer, v_fargs)
             end
             pop!(t.stack)
             return v
+        elseif Meta.isexpr(cf, :enter)
+            prev_bi = bi
+            bi += 1
         else
             error("Panic! Don't know how to handle control flow expression $cf")
         end
